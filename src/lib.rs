@@ -112,7 +112,13 @@ fn extract_blocks(source: &str) -> Vec<SfcBlock> {
     let mut blocks = Vec::new();
     let lower = source.to_ascii_lowercase();
     let mut template = source.as_bytes().to_vec();
-    let line_at = |offset: usize| source[..offset].bytes().filter(|&b| b == b'\n').count() as u32;
+    // Line counting accepts byte offsets, including the final byte of a UTF-8 character.
+    let line_at = |offset: usize| {
+        source.as_bytes()[..offset]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count() as u32
+    };
     let mut cursor = 0;
     while let Some(relative) = source[cursor..].find('<') {
         let start = cursor + relative;
@@ -725,6 +731,23 @@ mod tests {
         assert_eq!(scripts.len(), 1);
         assert_eq!(scripts[0].content, "let name = 'One';");
         assert_eq!(scripts[0].content_start_line, 1);
+    }
+
+    #[test]
+    fn unclosed_unicode_blocks_preserve_content_and_positions() {
+        for tag in ["script", "style"] {
+            for content in ["é", "漢", "😀", "\né", "é\n"] {
+                let source = format!("<{tag}>{content}");
+                let blocks = extract_blocks(&source);
+                assert_eq!(blocks.len(), 1);
+                assert_eq!(blocks[0].content, content);
+                assert_eq!(blocks[0].start_line, 0);
+                assert_eq!(blocks[0].content_start_line, 0);
+                assert_eq!(blocks[0].end_line, u32::from(content.starts_with('\n')));
+                let output = process_impl(&source, "App.svelte");
+                serde_json::from_str::<serde_json::Value>(&output).expect("in-band JSON");
+            }
+        }
     }
 
     fn collect_labels(value: &serde_json::Value) -> Vec<String> {
