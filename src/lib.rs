@@ -51,6 +51,7 @@ struct SvelteParser;
 // ---------------------------------------------------------------------------
 
 struct SfcBlock {
+    unclosed: bool,
     node_type: &'static str,
     label: String,
     start_line: u32,
@@ -171,6 +172,7 @@ fn extract_blocks(source: &str) -> Vec<SfcBlock> {
             parts.push(lang);
         }
         blocks.push(SfcBlock {
+            unclosed: closing_span.is_none(),
             node_type: if tag == "script" {
                 "script_block"
             } else {
@@ -200,6 +202,7 @@ fn extract_blocks(source: &str) -> Vec<SfcBlock> {
     ) {
         let content = lines[start..=end].join("\n");
         blocks.push(SfcBlock {
+            unclosed: false,
             node_type: "template_body",
             label: "template".into(),
             start_line: start as u32,
@@ -495,6 +498,9 @@ fn process_impl(source: &str, filename: &str) -> String {
         .unwrap_or("component");
 
     let mut blocks = extract_blocks(source);
+    if blocks.iter().any(|block| block.unclosed) {
+        return r#"{"error":"Unclosed script or style block"}"#.to_string();
+    }
     // Sort by start_line for deterministic output
     blocks.sort_by_key(|b| b.start_line);
 
@@ -745,7 +751,8 @@ mod tests {
                 assert_eq!(blocks[0].content_start_line, 0);
                 assert_eq!(blocks[0].end_line, u32::from(content.starts_with('\n')));
                 let output = process_impl(&source, "App.svelte");
-                serde_json::from_str::<serde_json::Value>(&output).expect("in-band JSON");
+                let value: serde_json::Value = serde_json::from_str(&output).expect("in-band JSON");
+                assert_eq!(value["error"], "Unclosed script or style block");
             }
         }
     }
