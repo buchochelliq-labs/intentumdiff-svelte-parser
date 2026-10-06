@@ -95,128 +95,114 @@ fn attr_lang(attrs: &str) -> Option<String> {
     None
 }
 
-fn extract_blocks(source: &str) -> Vec<SfcBlock> {
-    const SFC_TAGS: &[&str] = &["script", "style"];
-    let mut blocks: Vec<SfcBlock> = Vec::new();
-    let lines: Vec<&str> = source.lines().collect();
-    let mut template_lines: Vec<u32> = Vec::new();
-
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i].trim_start();
-        if let Some((tag, attrs)) = parse_tag_open(line) {
-            if SFC_TAGS.contains(&tag.as_str()) {
-                let start_line = i as u32;
-                let closing = format!("</{}", tag);
-                let opening = format!("<{}", tag);
-                let mut depth: i32 = 1;
-                let mut j = i + 1;
-                let content_start = i + 1;
-                while i < lines.len() && !lines[i].contains('>') {
-                    i += 1;
-                }
-                while j < lines.len() {
-                    let l = lines[j];
-                    let open_count = l.matches(&opening).count() as i32;
-                    let close_count = l.matches(closing.as_str()).count() as i32;
-                    depth += open_count - close_count;
-                    if depth <= 0 {
-                        let end_line = j as u32;
-                        let content: String = lines[content_start.min(j)..j].join("\n");
-                        let hash = content_hash(&content);
-                        let (node_type, label) = match tag.as_str() {
-                            "script" => {
-                                let is_module = attr_contains(&attrs, "context=\"module\"")
-                                    || attr_contains(&attrs, "context='module'");
-                                let mut parts = vec!["script".to_string()];
-                                if is_module {
-                                    parts.push("module".to_string());
-                                }
-                                if let Some(lang) = attr_lang(&attrs) {
-                                    parts.push(lang);
-                                }
-                                ("script_block", parts.join(":"))
-                            }
-                            "style" => {
-                                let is_global = attr_contains(&attrs, "global");
-                                let mut parts = vec!["style".to_string()];
-                                if is_global {
-                                    parts.push("global".to_string());
-                                }
-                                if let Some(lang) = attr_lang(&attrs) {
-                                    parts.push(lang);
-                                }
-                                ("style_block", parts.join(":"))
-                            }
-                            _ => ("custom_block", tag.clone()),
-                        };
-                        blocks.push(SfcBlock {
-                            node_type,
-                            label,
-                            start_line,
-                            end_line,
-                            content_start_line: start_line + 1,
-                            content,
-                            content_hash: hash,
-                        });
-                        i = j;
-                        break;
-                    }
-                    j += 1;
-                }
-                if depth > 0 {
-                    let end_line = lines.len().saturating_sub(1) as u32;
-                    let content: String = lines[content_start..].join("\n");
-                    let label = match tag.as_str() {
-                        "script" => "script".to_string(),
-                        "style" => "style".to_string(),
-                        _ => tag.clone(),
-                    };
-                    let node_type: &'static str = match tag.as_str() {
-                        "script" => "script_block",
-                        "style" => "style_block",
-                        _ => "custom_block",
-                    };
-                    blocks.push(SfcBlock {
-                        node_type,
-                        label,
-                        start_line,
-                        end_line,
-                        content_start_line: start_line + 1,
-                        content: content.clone(),
-                        content_hash: content_hash(&content),
-                    });
-                    i = lines.len();
-                }
-            } else {
-                template_lines.push(i as u32);
-            }
-        } else {
-            template_lines.push(i as u32);
+fn tag_end(source: &str, start: usize) -> Option<usize> {
+    let mut quote = None;
+    for (offset, c) in source[start..].char_indices() {
+        match (quote, c) {
+            (Some(q), c) if q == c => quote = None,
+            (None, '\'' | '"') => quote = Some(c),
+            (None, '>') => return Some(start + offset + 1),
+            _ => {}
         }
-        i += 1;
     }
+    None
+}
 
-    // Add template_body node for remaining markup if any
-    if !template_lines.is_empty() {
-        let tstart = *template_lines.first().unwrap();
-        let tend = *template_lines.last().unwrap();
-        let template_content: String = template_lines
-            .iter()
-            .map(|&l| lines[l as usize])
-            .collect::<Vec<_>>()
-            .join("\n");
+fn extract_blocks(source: &str) -> Vec<SfcBlock> {
+    let mut blocks = Vec::new();
+    let lower = source.to_ascii_lowercase();
+    let mut template = source.as_bytes().to_vec();
+    let line_at = |offset: usize| source[..offset].bytes().filter(|&b| b == b'\n').count() as u32;
+    let mut cursor = 0;
+    while let Some(relative) = source[cursor..].find('<') {
+        let start = cursor + relative;
+        // A commented example is template trivia, not an executable script block.
+        if source[start..].starts_with("<!--") {
+            cursor = source[start + 4..]
+                .find("-->")
+                .map_or(source.len(), |n| start + 4 + n + 3);
+            continue;
+        }
+        let Some(open_end) = tag_end(source, start) else {
+            break;
+        };
+        cursor = open_end;
+        let Some((tag, attrs)) = parse_tag_open(&source[start..open_end]) else {
+            continue;
+        };
+        if !matches!(tag.as_str(), "script" | "style") {
+            continue;
+        }
+        let closing = format!("</{tag}");
+        let mut close_search = open_end;
+        let mut closing_span = None;
+        while let Some(relative) = lower[close_search..].find(&closing) {
+            let close_start = close_search + relative;
+            let boundary = close_start + closing.len();
+            if source[boundary..].starts_with('>')
+                || source[boundary..].starts_with(char::is_whitespace)
+            {
+                if let Some(close_end) = tag_end(source, close_start) {
+                    closing_span = Some((close_start, close_end));
+                }
+                break;
+            }
+            close_search = boundary;
+        }
+        let (content_end, end) = closing_span.unwrap_or((source.len(), source.len()));
+        let content = source[open_end..content_end].to_string();
+        let mut parts = vec![tag.clone()];
+        if tag == "script"
+            && (attr_contains(&attrs, "context=\"module\"")
+                || attr_contains(&attrs, "context='module'"))
+        {
+            parts.push("module".into());
+        }
+        if tag == "style" && attr_contains(&attrs, "global") {
+            parts.push("global".into());
+        }
+        if let Some(lang) = attr_lang(&attrs) {
+            parts.push(lang);
+        }
+        blocks.push(SfcBlock {
+            node_type: if tag == "script" {
+                "script_block"
+            } else {
+                "style_block"
+            },
+            label: parts.join(":"),
+            start_line: line_at(start),
+            end_line: line_at(end.saturating_sub(1)),
+            content_start_line: line_at(open_end),
+            content_hash: content_hash(&content),
+            content,
+        });
+        // Retain template source on either side, including on the same line.
+        // Keep newline positions so child locations still refer to the original source.
+        for byte in &mut template[start..end] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+        cursor = end;
+    }
+    let template = String::from_utf8(template).expect("source UTF-8 with blocks replaced by ASCII");
+    let lines: Vec<_> = template.lines().collect();
+    if let (Some(start), Some(end)) = (
+        lines.iter().position(|l| !l.trim().is_empty()),
+        lines.iter().rposition(|l| !l.trim().is_empty()),
+    ) {
+        let content = lines[start..=end].join("\n");
         blocks.push(SfcBlock {
             node_type: "template_body",
-            label: "template".to_string(),
-            start_line: tstart,
-            end_line: tend,
-            content_start_line: tstart,
-            content: template_content.clone(),
-            content_hash: content_hash(&template_content),
+            label: "template".into(),
+            start_line: start as u32,
+            end_line: end as u32,
+            content_start_line: start as u32,
+            content_hash: content_hash(&content),
+            content,
         });
     }
-
     blocks
 }
 
@@ -676,6 +662,69 @@ mod tests {
         assert!(labels.iter().any(|label| label == "increment"));
         assert!(labels.iter().any(|label| label == "button"));
         assert!(labels.iter().any(|label| label == "on:click=increment"));
+    }
+
+    #[test]
+    fn inline_script_content_and_trailing_template_are_retained() {
+        let old = process_impl(
+            "<script>let name = 'One';</script><h1>{name}</h1>",
+            "App.svelte",
+        );
+        let new = process_impl(
+            "<script>let name = 'Two';</script><h1>{name}</h1>",
+            "App.svelte",
+        );
+        let old: serde_json::Value = serde_json::from_str(&old).unwrap();
+        let new: serde_json::Value = serde_json::from_str(&new).unwrap();
+        assert!(collect_labels(&old).contains(&"'One'".to_string()));
+        assert!(collect_labels(&new).contains(&"'Two'".to_string()));
+        assert!(collect_labels(&new).contains(&"h1".to_string()));
+        assert_ne!(old["structural_hash"], new["structural_hash"]);
+    }
+
+    #[test]
+    fn block_content_keeps_opening_and_closing_lines_and_positions() {
+        let source = "<h1>Olá</h1><script context=\"module\" lang=\"ts\">let a = 1;\nlet b = 2;</script><style global>h1 {color: red;}</style><p>{a}</p>";
+        let blocks = extract_blocks(source);
+        let script = blocks
+            .iter()
+            .find(|b| b.node_type == "script_block")
+            .unwrap();
+        assert_eq!(script.content, "let a = 1;\nlet b = 2;");
+        assert_eq!(script.label, "script:module:ts");
+        assert_eq!(
+            (
+                script.start_line,
+                script.content_start_line,
+                script.end_line
+            ),
+            (0, 0, 1)
+        );
+        let style = blocks
+            .iter()
+            .find(|b| b.node_type == "style_block")
+            .unwrap();
+        assert_eq!(style.content, "h1 {color: red;}");
+        assert_eq!(style.label, "style:global");
+        let template = blocks
+            .iter()
+            .find(|b| b.node_type == "template_body")
+            .unwrap();
+        assert!(template.content.contains("<h1>Olá</h1>"));
+        assert!(template.content.contains("<p>{a}</p>"));
+        assert!(!template.content.contains("let a"));
+    }
+
+    #[test]
+    fn quoted_tag_end_and_commented_script_do_not_swallow_content() {
+        let blocks = extract_blocks("<!-- <script>not code</script> -->\n<script data-note=\"a > b\">let name = 'One';</script>");
+        let scripts: Vec<_> = blocks
+            .iter()
+            .filter(|b| b.node_type == "script_block")
+            .collect();
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts[0].content, "let name = 'One';");
+        assert_eq!(scripts[0].content_start_line, 1);
     }
 
     fn collect_labels(value: &serde_json::Value) -> Vec<String> {
