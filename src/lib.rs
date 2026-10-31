@@ -823,7 +823,7 @@ mod tests {
                 assert_eq!(blocks[0].content, content);
                 assert_eq!(blocks[0].start_line, 0);
                 assert_eq!(blocks[0].content_start_line, 0);
-                assert_eq!(blocks[0].end_line, u32::from(content.starts_with('\n')));
+                assert_eq!(blocks[0].end_line, content.bytes().filter(|&b| b == b'\n').count() as u32);
                 let output = process_impl(&source, "App.svelte");
                 let value: serde_json::Value = serde_json::from_str(&output).expect("in-band JSON");
                 assert_eq!(value["error"], "Unclosed script or style block");
@@ -849,10 +849,10 @@ mod tests {
         }
         for (tree, label) in [(&old, "0"), (&new, "1")] {
             let node = value_span(tree, label);
-            assert_eq!(node["start_line"], 1);
-            assert_eq!(node["end_line"], 1);
-            assert_eq!(node["start_col"], 14);
-            assert_eq!(node["end_col"], 15);
+            assert_eq!(node["position"]["start_line"], 1);
+            assert_eq!(node["position"]["end_line"], 1);
+            assert_eq!(node["position"]["start_col"], 14);
+            assert_eq!(node["position"]["end_col"], 15);
         }
         assert_ne!(old["structural_hash"], new["structural_hash"]);
     }
@@ -869,12 +869,12 @@ mod tests {
         }
         let value = find(&result, "declaration_value", "0").unwrap();
         let column = source.find("0;").unwrap() as u32;
-        assert_eq!(value["start_col"], column);
-        assert_eq!(value["end_col"], column + 1);
+        assert_eq!(value["position"]["start_col"], column);
+        assert_eq!(value["position"]["end_col"], column + 1);
         let interpolation = find(&result, "interpolation", "count").unwrap();
         let col = source.rfind("{count}").unwrap() as u32 + 1;
-        assert_eq!(interpolation["start_col"], col);
-        assert_eq!(interpolation["end_col"], col + 5);
+        assert_eq!(interpolation["position"]["start_col"], col);
+        assert_eq!(interpolation["position"]["end_col"], col + 5);
     }
 
     #[test]
@@ -886,13 +886,13 @@ mod tests {
             node["children"].as_array()?.iter().find_map(|child| find(child, kind, label))
         }
         let assignment = find(&result, "assignment_value", "2").unwrap();
-        assert_eq!(assignment["start_line"], 1);
-        assert_eq!(assignment["start_col"], 11);
-        assert_eq!(assignment["end_col"], 12);
+        assert_eq!(assignment["position"]["start_line"], 1);
+        assert_eq!(assignment["position"]["start_col"], 11);
+        assert_eq!(assignment["position"]["end_col"], 12);
         let value = find(&result, "style_value", "red").unwrap();
-        assert_eq!(value["start_line"], 5);
-        assert_eq!(value["start_col"], 11);
-        assert_eq!(value["end_col"], 14);
+        assert_eq!(value["position"]["start_line"], 5);
+        assert_eq!(value["position"]["start_col"], 11);
+        assert_eq!(value["position"]["end_col"], 14);
     }
 
     fn collect_labels(value: &serde_json::Value) -> Vec<String> {
