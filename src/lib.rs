@@ -55,8 +55,11 @@ struct SfcBlock {
     node_type: &'static str,
     label: String,
     start_line: u32,
+    start_col: u32,
     end_line: u32,
+    end_col: u32,
     content_start_line: u32,
+    content_start_col: u32,
     content: String,
     content_hash: String,
 }
@@ -109,17 +112,18 @@ fn tag_end(source: &str, start: usize) -> Option<usize> {
     None
 }
 
+// Source spans are 0-based UTF-8 byte columns and have exclusive ends.
+fn source_position(source: &str, offset: usize) -> (u32, u32) {
+    let prefix = &source[..offset];
+    let line = prefix.as_bytes().iter().filter(|&&b| b == b'\n').count() as u32;
+    let line_start = prefix.rfind('\n').map_or(0, |index| index + 1);
+    (line, (offset - line_start) as u32)
+}
+
 fn extract_blocks(source: &str) -> Vec<SfcBlock> {
     let mut blocks = Vec::new();
     let lower = source.to_ascii_lowercase();
     let mut template = source.as_bytes().to_vec();
-    // Line counting accepts byte offsets, including the final byte of a UTF-8 character.
-    let line_at = |offset: usize| {
-        source.as_bytes()[..offset]
-            .iter()
-            .filter(|&&b| b == b'\n')
-            .count() as u32
-    };
     let mut cursor = 0;
     while let Some(relative) = source[cursor..].find('<') {
         let start = cursor + relative;
@@ -171,6 +175,9 @@ fn extract_blocks(source: &str) -> Vec<SfcBlock> {
         if let Some(lang) = attr_lang(&attrs) {
             parts.push(lang);
         }
+        let (start_line, start_col) = source_position(source, start);
+        let (end_line, end_col) = source_position(source, end);
+        let (content_start_line, content_start_col) = source_position(source, open_end);
         blocks.push(SfcBlock {
             unclosed: closing_span.is_none(),
             node_type: if tag == "script" {
@@ -179,9 +186,12 @@ fn extract_blocks(source: &str) -> Vec<SfcBlock> {
                 "style_block"
             },
             label: parts.join(":"),
-            start_line: line_at(start),
-            end_line: line_at(end.saturating_sub(1)),
-            content_start_line: line_at(open_end),
+            start_line,
+            start_col,
+            end_line,
+            end_col,
+            content_start_line,
+            content_start_col,
             content_hash: content_hash(&content),
             content,
         });
@@ -206,8 +216,11 @@ fn extract_blocks(source: &str) -> Vec<SfcBlock> {
             node_type: "template_body",
             label: "template".into(),
             start_line: start as u32,
+            start_col: 0,
             end_line: end as u32,
+            end_col: lines[end].len() as u32,
             content_start_line: start as u32,
+            content_start_col: 0,
             content_hash: content_hash(&content),
             content,
         });
@@ -215,8 +228,23 @@ fn extract_blocks(source: &str) -> Vec<SfcBlock> {
     blocks
 }
 
-fn make_leaf(id: &str, node_type: &str, label: impl Into<String>, line: u32) -> SemanticNode {
-    SemanticNodeBuilder::new(id, node_type, label.into(), line, 0, line, 0, "").build()
+fn make_leaf(
+    id: &str,
+    node_type: &str,
+    label: impl Into<String>,
+    line: u32,
+    start_col: u32,
+    end_col: u32,
+) -> SemanticNode {
+    SemanticNodeBuilder::new(id, node_type, label.into(), line, start_col, line, end_col, "").build()
+}
+
+fn line_column(content_line: usize, first_line_column: u32, local_byte: usize) -> u32 {
+    if content_line == 0 {
+        first_line_column + local_byte as u32
+    } else {
+        local_byte as u32
+    }
 }
 
 fn is_identifier_like(value: &str) -> bool {
@@ -236,15 +264,15 @@ fn normalize_statement(line: &str) -> String {
         .to_string()
 }
 
-fn parse_attr_labels(attrs: &str) -> Vec<String> {
+fn parse_attr_labels(attrs: &str) -> Vec<(String, usize, usize)> {
+    let mut cursor = 0;
     attrs
         .split_whitespace()
         .filter_map(|part| {
-            let clean = part
-                .trim()
-                .trim_end_matches('>')
-                .trim_end_matches('/')
-                .trim();
+            let start = cursor + attrs[cursor..].find(part)?;
+            let end = start + part.len();
+            cursor = end;
+            let clean = part.trim().trim_end_matches('>').trim_end_matches('/').trim();
             if clean.is_empty() {
                 return None;
             }
@@ -253,8 +281,8 @@ fn parse_attr_labels(attrs: &str) -> Vec<String> {
             if name.is_empty() {
                 return None;
             }
-            if value.is_empty() {
-                Some(name.to_string())
+            let label = if value.is_empty() {
+                name.to_string()
             } else {
                 let value = value
                     .trim()
@@ -262,8 +290,9 @@ fn parse_attr_labels(attrs: &str) -> Vec<String> {
                     .trim_matches('\'')
                     .trim_matches('{')
                     .trim_matches('}');
-                Some(format!("{}={}", name, value))
-            }
+                format!("{}={}", name, value)
+            };
+            Some((label, start, end))
         })
         .collect()
 }
@@ -288,48 +317,37 @@ fn parse_tag_segment(segment: &str) -> Option<(String, String)> {
     Some((tag.to_lowercase(), attrs))
 }
 
-fn extract_brace_labels(line: &str) -> Vec<String> {
-    let mut labels = Vec::new();
-    let mut rest = line;
-    while let Some(start) = rest.find('{') {
-        if rest[start..].starts_with("{{") {
-            rest = &rest[start + 2..];
-            continue;
-        }
-        let after = &rest[start + 1..];
-        if let Some(end) = after.find('}') {
-            let label = after[..end].trim();
-            if !label.is_empty() && !label.starts_with('#') && !label.starts_with('/') {
-                labels.push(label.to_string());
-            }
-            rest = &after[end + 1..];
-        } else {
-            break;
-        }
-    }
-    labels
-}
-
-fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) -> Vec<SemanticNode> {
+fn extract_template_children(
+    content: &str,
+    start_line: u32,
+    first_line_column: u32,
+    id_prefix: &str,
+) -> Vec<SemanticNode> {
     let mut children = Vec::new();
     for (line_idx, line) in content.lines().enumerate() {
         let absolute_line = start_line + line_idx as u32;
         let mut rest = line;
+        let mut consumed = 0;
         while let Some(open_idx) = rest.find('<') {
             let after_open = &rest[open_idx + 1..];
             if let Some(close_idx) = after_open.find('>') {
                 let segment = &after_open[..close_idx];
                 if let Some((tag, attrs)) = parse_tag_segment(segment) {
                     let child_id = format!("{}.{}", id_prefix, children.len());
-                    let attr_children: Vec<SemanticNode> = parse_attr_labels(&attrs)
+                    let local_start = consumed + open_idx;
+                    let local_end = local_start + 2 + close_idx;
+                    let attr_start = segment.find(&attrs).unwrap_or(segment.len());
+                    let attr_children = parse_attr_labels(&attrs)
                         .into_iter()
                         .enumerate()
-                        .map(|(i, label)| {
+                        .map(|(i, (label, a, b))| {
                             make_leaf(
                                 &format!("{}.{}", child_id, i),
                                 "attribute",
                                 label,
                                 absolute_line,
+                                line_column(line_idx, first_line_column, local_start + 1 + attr_start + a),
+                                line_column(line_idx, first_line_column, local_start + 1 + attr_start + b),
                             )
                         })
                         .collect();
@@ -339,23 +357,44 @@ fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) ->
                             "element",
                             tag,
                             absolute_line,
-                            0,
+                            line_column(line_idx, first_line_column, local_start),
                             absolute_line,
-                            0,
+                            line_column(line_idx, first_line_column, local_end),
                             "",
                         )
                         .children(attr_children)
                         .build(),
                     );
                 }
+                consumed += open_idx + close_idx + 2;
                 rest = &after_open[close_idx + 1..];
             } else {
                 break;
             }
         }
-        for label in extract_brace_labels(line) {
-            let child_id = format!("{}.{}", id_prefix, children.len());
-            children.push(make_leaf(&child_id, "interpolation", label, absolute_line));
+        let mut cursor = 0;
+        while let Some(relative) = line[cursor..].find('{') {
+            let brace = cursor + relative;
+            if line[brace..].starts_with("{{") {
+                cursor = brace + 2;
+                continue;
+            }
+            let after = brace + 1;
+            let Some(close_rel) = line[after..].find('}') else { break };
+            let close = after + close_rel;
+            let raw_label = &line[after..close];
+            let label = raw_label.trim();
+            if !label.is_empty() && !label.starts_with('#') && !label.starts_with('/') {
+                let leading = raw_label.len() - raw_label.trim_start().len();
+                let start = after + leading;
+                let child_id = format!("{}.{}", id_prefix, children.len());
+                children.push(make_leaf(
+                    &child_id, "interpolation", label, absolute_line,
+                    line_column(line_idx, first_line_column, start),
+                    line_column(line_idx, first_line_column, start + label.len()),
+                ));
+            }
+            cursor = close + 1;
         }
     }
     children
@@ -406,7 +445,12 @@ fn assignment_label(line: &str) -> Option<String> {
     None
 }
 
-fn extract_script_children(content: &str, start_line: u32, id_prefix: &str) -> Vec<SemanticNode> {
+fn extract_script_children(
+    content: &str,
+    start_line: u32,
+    first_line_column: u32,
+    id_prefix: &str,
+) -> Vec<SemanticNode> {
     let mut children = Vec::new();
     for (line_idx, raw_line) in content.lines().enumerate() {
         let line = normalize_statement(raw_line);
@@ -414,45 +458,57 @@ fn extract_script_children(content: &str, start_line: u32, id_prefix: &str) -> V
             continue;
         }
         let absolute_line = start_line + line_idx as u32;
+        let leading = raw_line.find(&line).expect("normalized statement occurs in input line");
+        let start_col = line_column(line_idx, first_line_column, leading);
+        let end_col = start_col + line.len() as u32;
         let child_id = format!("{}.{}", id_prefix, children.len());
         let node = if line.starts_with("import ") {
-            Some(make_leaf(
-                &child_id,
-                "import_statement",
-                line,
-                absolute_line,
-            ))
+            Some(make_leaf(&child_id, "import_statement", line, absolute_line, start_col, end_col))
         } else if let Some(name) = declaration_name(&line) {
             let mut decl = make_leaf(
-                &child_id,
-                "variable_declaration",
-                name.to_string(),
-                absolute_line,
+                &child_id, "variable_declaration", name.to_string(),
+                absolute_line, start_col, end_col,
             );
-            // #46: the RHS is review content — a value edit (let count = 0 -> 1)
-            // hashed style-only with name-only declarations.
-            if let Some((_, rhs)) = line.split_once('=') {
-                let rhs = rhs.trim().trim_end_matches(';').trim();
+            // Retain the RHS in Rust semantics; never turn a numeric change into style-only.
+            if let Some(equals) = line.find('=') {
+                let remainder = &line[equals + 1..];
+                let rhs = remainder.trim();
                 if !rhs.is_empty() {
+                    let rhs_start = start_col + (equals + 1 + remainder.len() - remainder.trim_start().len()) as u32;
                     decl.children = vec![make_leaf(
-                        &format!("{child_id}.0"),
-                        "declaration_value",
-                        rhs.to_string(),
-                        absolute_line,
+                        &format!("{child_id}.0"), "declaration_value", rhs,
+                        absolute_line, rhs_start, rhs_start + rhs.len() as u32,
                     )];
                 }
             }
             Some(decl)
         } else if let Some(name) = function_name(&line) {
             Some(make_leaf(
-                &child_id,
-                "function_declaration",
-                name.to_string(),
-                absolute_line,
+                &child_id, "function_declaration", name.to_string(),
+                absolute_line, start_col, end_col,
             ))
+        } else if let Some(label) = assignment_label(&line) {
+            let mut assignment = make_leaf(
+                &child_id, "assignment_statement", label,
+                absolute_line, start_col, end_col,
+            );
+            if let Some((index, op)) = ["+=", "-=", "*=", "/=", "="]
+                .into_iter()
+                .find_map(|op| line.find(op).map(|index| (index, op)))
+            {
+                let remainder = &line[index + op.len()..];
+                let rhs = remainder.trim();
+                if !rhs.is_empty() {
+                    let rhs_start = start_col + (index + op.len() + remainder.len() - remainder.trim_start().len()) as u32;
+                    assignment.children = vec![make_leaf(
+                        &format!("{child_id}.0"), "assignment_value", rhs,
+                        absolute_line, rhs_start, rhs_start + rhs.len() as u32,
+                    )];
+                }
+            }
+            Some(assignment)
         } else {
-            assignment_label(&line)
-                .map(|label| make_leaf(&child_id, "assignment_statement", label, absolute_line))
+            None
         };
         if let Some(node) = node {
             children.push(node);
@@ -461,7 +517,12 @@ fn extract_script_children(content: &str, start_line: u32, id_prefix: &str) -> V
     children
 }
 
-fn extract_style_children(content: &str, start_line: u32, id_prefix: &str) -> Vec<SemanticNode> {
+fn extract_style_children(
+    content: &str,
+    start_line: u32,
+    first_line_column: u32,
+    id_prefix: &str,
+) -> Vec<SemanticNode> {
     let mut children = Vec::new();
     for (line_idx, raw_line) in content.lines().enumerate() {
         let line = raw_line.trim();
@@ -469,21 +530,36 @@ fn extract_style_children(content: &str, start_line: u32, id_prefix: &str) -> Ve
             continue;
         }
         let absolute_line = start_line + line_idx as u32;
+        let leading = raw_line.find(line).expect("trimmed style statement occurs in input line");
+        let start_col = line_column(line_idx, first_line_column, leading);
+        let end_col = start_col + line.len() as u32;
         let child_id = format!("{}.{}", id_prefix, children.len());
         if let Some(selector) = line.strip_suffix('{') {
             let selector = selector.trim();
             if !selector.is_empty() {
-                children.push(make_leaf(&child_id, "style_rule", selector, absolute_line));
+                children.push(make_leaf(
+                    &child_id, "style_rule", selector,
+                    absolute_line, start_col, end_col,
+                ));
             }
-        } else if let Some((property, _)) = line.split_once(':') {
+        } else if let Some((property, value)) = line.split_once(':') {
             let property = property.trim();
             if !property.is_empty() {
-                children.push(make_leaf(
-                    &child_id,
-                    "style_declaration",
-                    property,
-                    absolute_line,
-                ));
+                let mut decl = make_leaf(
+                    &child_id, "style_declaration", property,
+                    absolute_line, start_col, end_col,
+                );
+                let value = value.trim().trim_end_matches(';').trim_end_matches('}').trim();
+                if !value.is_empty() {
+                    let raw_value = &line[line.find(':').unwrap() + 1..];
+                    let local = line.find(':').unwrap() + 1 + raw_value.len() - raw_value.trim_start().len();
+                    let value_col = start_col + local as u32;
+                    decl.children = vec![make_leaf(
+                        &format!("{child_id}.0"), "style_value", value,
+                        absolute_line, value_col, value_col + value.len() as u32,
+                    )];
+                }
+                children.push(decl);
             }
         }
     }
@@ -504,17 +580,15 @@ fn process_impl(source: &str, filename: &str) -> String {
     // Sort by start_line for deterministic output
     blocks.sort_by_key(|b| b.start_line);
 
-    let end_line = source.lines().count().saturating_sub(1) as u32;
-
     let children: Vec<SemanticNode> = blocks
         .iter()
         .enumerate()
         .map(|(i, b)| {
             let id = format!("0.{}", i);
             let block_children = match b.node_type {
-                "script_block" => extract_script_children(&b.content, b.content_start_line, &id),
-                "style_block" => extract_style_children(&b.content, b.content_start_line, &id),
-                "template_body" => extract_template_children(&b.content, b.content_start_line, &id),
+                "script_block" => extract_script_children(&b.content, b.content_start_line, b.content_start_col, &id),
+                "style_block" => extract_style_children(&b.content, b.content_start_line, b.content_start_col, &id),
+                "template_body" => extract_template_children(&b.content, b.content_start_line, b.content_start_col, &id),
                 _ => Vec::new(),
             };
             SemanticNodeBuilder::new(
@@ -522,9 +596,9 @@ fn process_impl(source: &str, filename: &str) -> String {
                 b.node_type,
                 b.label.clone(),
                 b.start_line,
-                0,
+                b.start_col,
                 b.end_line,
-                0,
+                b.end_col,
                 b.content_hash.clone(),
             )
             .children(block_children)
@@ -551,8 +625,8 @@ fn process_impl(source: &str, filename: &str) -> String {
         stem.to_string(),
         0,
         0,
-        end_line,
-        0,
+        source_position(source, source.len()).0,
+        source_position(source, source.len()).1,
         root_hash,
     )
     .children(children)
@@ -755,6 +829,70 @@ mod tests {
                 assert_eq!(value["error"], "Unclosed script or style block");
             }
         }
+    }
+
+
+    #[test]
+    fn numeric_literal_has_exact_source_byte_span_on_both_sides() {
+        let old_source = "<script>\n  let count = 0;\n</script>\n<h1>{count}</h1>";
+        let new_source = old_source.replacen("= 0;", "= 1;", 1);
+        let old: serde_json::Value = serde_json::from_str(&process_impl(old_source, "App.svelte")).unwrap();
+        let new: serde_json::Value = serde_json::from_str(&process_impl(&new_source, "App.svelte")).unwrap();
+        fn value_span<'a>(tree: &'a serde_json::Value, label: &str) -> &'a serde_json::Value {
+            fn find<'a>(node: &'a serde_json::Value, label: &str) -> Option<&'a serde_json::Value> {
+                if node["node_type"] == "declaration_value" && node["label"] == label {
+                    return Some(node);
+                }
+                node["children"].as_array()?.iter().find_map(|child| find(child, label))
+            }
+            find(tree, label).expect("Rust declaration value must be source-anchored")
+        }
+        for (tree, label) in [(&old, "0"), (&new, "1")] {
+            let node = value_span(tree, label);
+            assert_eq!(node["start_line"], 1);
+            assert_eq!(node["end_line"], 1);
+            assert_eq!(node["start_col"], 14);
+            assert_eq!(node["end_col"], 15);
+        }
+        assert_ne!(old["structural_hash"], new["structural_hash"]);
+    }
+
+    #[test]
+    fn inline_unicode_script_and_template_have_real_byte_columns() {
+        let source = "<h1>é</h1><script>let count = 0;</script><p>{count}</p>";
+        let result: serde_json::Value = serde_json::from_str(&process_impl(source, "App.svelte")).unwrap();
+        fn find<'a>(node: &'a serde_json::Value, kind: &str, label: &str) -> Option<&'a serde_json::Value> {
+            if node["node_type"] == kind && node["label"] == label {
+                return Some(node);
+            }
+            node["children"].as_array()?.iter().find_map(|child| find(child, kind, label))
+        }
+        let value = find(&result, "declaration_value", "0").unwrap();
+        let column = source.find("0;").unwrap() as u32;
+        assert_eq!(value["start_col"], column);
+        assert_eq!(value["end_col"], column + 1);
+        let interpolation = find(&result, "interpolation", "count").unwrap();
+        let col = source.rfind("{count}").unwrap() as u32 + 1;
+        assert_eq!(interpolation["start_col"], col);
+        assert_eq!(interpolation["end_col"], col + 5);
+    }
+
+    #[test]
+    fn assignment_and_style_rhs_keep_source_anchored_semantics() {
+        let source = "<script>\n  count += 2;\n</script>\n<style>\n  p {\n    color: red;\n  }\n</style>";
+        let result: serde_json::Value = serde_json::from_str(&process_impl(source, "App.svelte")).unwrap();
+        fn find<'a>(node: &'a serde_json::Value, kind: &str, label: &str) -> Option<&'a serde_json::Value> {
+            if node["node_type"] == kind && node["label"] == label { return Some(node); }
+            node["children"].as_array()?.iter().find_map(|child| find(child, kind, label))
+        }
+        let assignment = find(&result, "assignment_value", "2").unwrap();
+        assert_eq!(assignment["start_line"], 1);
+        assert_eq!(assignment["start_col"], 11);
+        assert_eq!(assignment["end_col"], 12);
+        let value = find(&result, "style_value", "red").unwrap();
+        assert_eq!(value["start_line"], 5);
+        assert_eq!(value["start_col"], 11);
+        assert_eq!(value["end_col"], 14);
     }
 
     fn collect_labels(value: &serde_json::Value) -> Vec<String> {
