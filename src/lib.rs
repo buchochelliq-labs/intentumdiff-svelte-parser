@@ -2,14 +2,18 @@
 //!
 //! Handles `.svelte` single-file component files.
 //!
-//! Svelte SFCs consist of optional `<script>`, `<script context="module">`,
-//! and `<style>` blocks; everything else is template markup.
+//! Svelte SFCs consist of optional top-level `<script>`, `<script module>`
+//! (Svelte 4: `context="module"`) and `<style>` blocks; everything else,
+//! including a `<script>` nested in `<svelte:head>`, is template markup.
 //!
 //! Semantic nodes produced:
 //!   svelte_component     — root; label = filename stem
-//!   script_block         — `<script ...>` block (label includes "module" if context=module)
-//!   style_block          — `<style ...>` block (label includes "global" if global)
+//!   script_block         — top-level `<script ...>` (label includes "module" for module context)
+//!   style_block          — top-level `<style ...>` (label includes "global" if global)
+//!   attribute            — other block/element attributes (`src=./a.js`)
 //!   template_body        — the remaining markup outside of script/style blocks
+//!   element / interpolation / block_tag / text — template structure and payload
+//!   variable_declaration / assignment_statement / expression_statement / ... — script
 
 use intentumdiff_plugin_sdk::tree::{SemanticNode, SemanticNodeBuilder};
 
@@ -62,6 +66,10 @@ struct SfcBlock {
     content_start_col: u32,
     content: String,
     content_hash: String,
+    /// Raw attribute text of the opening tag (script/style blocks only).
+    attrs: String,
+    /// Byte offset in the source where `attrs` search starts (after the tag name).
+    attrs_offset: usize,
 }
 
 fn content_hash(s: &str) -> String {
@@ -112,6 +120,209 @@ fn tag_end(source: &str, start: usize) -> Option<usize> {
     None
 }
 
+/// Byte span `(start, end)` of the first `</tag>` at or after `from`.
+fn find_closing_tag(source: &str, lower: &str, from: usize, tag: &str) -> Option<(usize, usize)> {
+    let closing = format!("</{tag}");
+    let mut close_search = from;
+    while let Some(relative) = lower[close_search..].find(&closing) {
+        let close_start = close_search + relative;
+        let boundary = close_start + closing.len();
+        if source[boundary..].starts_with('>') || source[boundary..].starts_with(char::is_whitespace)
+        {
+            return tag_end(source, close_start).map(|close_end| (close_start, close_end));
+        }
+        close_search = boundary;
+    }
+    None
+}
+
+/// Element names that can hold children (`div`, `svelte:head`, `My.Component`).
+fn is_element_name(tag: &str) -> bool {
+    let mut chars = tag.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '-' | '_'))
+}
+
+/// HTML void elements, plus elements whose end tag may be omitted; neither is
+/// tracked as an open parent so an implicit close cannot hide a top-level block.
+fn is_void_or_optional_close(tag: &str) -> bool {
+    matches!(
+        tag,
+        "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link" | "meta"
+            | "param" | "source" | "track" | "wbr" | "p" | "li" | "dt" | "dd" | "option"
+            | "optgroup" | "tr" | "td" | "th" | "thead" | "tbody" | "tfoot" | "rp" | "rt"
+            | "colgroup" | "caption" | "html" | "head" | "body"
+    )
+}
+
+/// `<script module>` (Svelte 5) or `<script context="module">` (Svelte 4).
+fn is_module_script(attrs: &str) -> bool {
+    split_attrs(attrs).iter().any(|(raw, _, _)| {
+        let (name, value) = attr_name_value(raw);
+        let name = name.to_ascii_lowercase();
+        (name == "module" && value.is_empty())
+            || (name == "context" && value.eq_ignore_ascii_case("module"))
+    })
+}
+
+/// Attributes already encoded in a block label (`lang`, module context, `global`).
+fn is_block_label_attr(tag: &str, name: &str, value: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name == "lang"
+        || (tag == "script" && name == "module" && value.is_empty())
+        || (tag == "script" && name == "context" && value.eq_ignore_ascii_case("module"))
+        || (tag == "style" && name == "global" && value.is_empty())
+}
+
+/// Quote- and brace-aware attribute split: `(raw, start, end)` byte spans in `attrs`.
+fn split_attrs(attrs: &str) -> Vec<(String, usize, usize)> {
+    let mut out = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut quote: Option<char> = None;
+    let mut braces = 0usize;
+    for (index, c) in attrs.char_indices() {
+        match (quote, c) {
+            (Some(q), c) if q == c => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') if start.is_some() => quote = Some(c),
+            (None, '{') => {
+                braces += 1;
+                start.get_or_insert(index);
+            }
+            (None, '}') => braces = braces.saturating_sub(1),
+            (None, c) if c.is_whitespace() && braces == 0 => {
+                if let Some(s) = start.take() {
+                    out.push((attrs[s..index].to_string(), s, index));
+                }
+            }
+            (None, _) => {
+                start.get_or_insert(index);
+            }
+        }
+    }
+    if let Some(s) = start {
+        out.push((attrs[s..].to_string(), s, attrs.len()));
+    }
+    out
+}
+
+/// `name="value"` -> (`name`, `value`), stripping quotes; a `{expr}` value keeps
+/// its expression, normalized so quote spelling and spacing are not semantic.
+fn attr_name_value(raw: &str) -> (String, String) {
+    let clean = raw.trim().trim_end_matches('>').trim_end_matches('/').trim();
+    let (name, value) = clean.split_once('=').unwrap_or((clean, ""));
+    let value = value.trim();
+    let value = if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+    {
+        value[1..value.len() - 1].to_string()
+    } else {
+        value.to_string()
+    };
+    let value = match value.strip_prefix('{').and_then(|v| v.strip_suffix('}')) {
+        Some(expr) => normalize_js(expr, &mut false),
+        None => value,
+    };
+    (name.trim().to_string(), value)
+}
+
+/// Canonical JavaScript expression text for labels: comments dropped, `'x'` and
+/// `"x"` spelled the same, layout whitespace removed where it cannot change
+/// tokenization. Template literals are kept verbatim. `in_comment` carries an
+/// open `/* */` comment across lines.
+fn normalize_js(text: &str, in_comment: &mut bool) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut pending_space = false;
+    let mut i = 0;
+    let push_token = |out: &mut String, pending_space: &mut bool, c: char| {
+        if *pending_space {
+            if let Some(last) = out.chars().last() {
+                let word = |ch: char| ch.is_alphanumeric() || ch == '_' || ch == '$';
+                if (word(last) && word(c)) || (last == c && matches!(c, '+' | '-')) {
+                    out.push(' ');
+                }
+            }
+            *pending_space = false;
+        }
+        out.push(c);
+    };
+    while i < chars.len() {
+        let c = chars[i];
+        if *in_comment {
+            if c == '*' && chars.get(i + 1) == Some(&'/') {
+                *in_comment = false;
+                pending_space = true;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        match c {
+            '/' if chars.get(i + 1) == Some(&'/') => break,
+            '/' if chars.get(i + 1) == Some(&'*') => {
+                *in_comment = true;
+                i += 2;
+            }
+            '\'' | '"' => {
+                let mut value = String::new();
+                i += 1;
+                while i < chars.len() && chars[i] != c {
+                    if chars[i] == '\\' && i + 1 < chars.len() {
+                        let next = chars[i + 1];
+                        if next == '\'' || next == '"' {
+                            value.push(next);
+                        } else {
+                            value.push('\\');
+                            value.push(next);
+                        }
+                        i += 2;
+                    } else {
+                        value.push(chars[i]);
+                        i += 1;
+                    }
+                }
+                i += 1;
+                push_token(&mut out, &mut pending_space, '"');
+                for ch in value.chars() {
+                    if ch == '"' {
+                        out.push('\\');
+                    }
+                    out.push(ch);
+                }
+                out.push('"');
+            }
+            '`' => {
+                push_token(&mut out, &mut pending_space, '`');
+                i += 1;
+                while i < chars.len() && chars[i] != '`' {
+                    if chars[i] == '\\' && i + 1 < chars.len() {
+                        out.push(chars[i]);
+                        i += 1;
+                    }
+                    out.push(chars[i]);
+                    i += 1;
+                }
+                if i < chars.len() {
+                    out.push('`');
+                }
+                i += 1;
+            }
+            c if c.is_whitespace() => {
+                pending_space = true;
+                i += 1;
+            }
+            c => {
+                push_token(&mut out, &mut pending_space, c);
+                i += 1;
+            }
+        }
+    }
+    out.trim_end_matches([';', ',']).trim().to_string()
+}
+
 // Source spans are 0-based UTF-8 byte columns and have exclusive ends.
 fn source_position(source: &str, offset: usize) -> (u32, u32) {
     let prefix = &source[..offset];
@@ -125,6 +336,7 @@ fn extract_blocks(source: &str) -> Vec<SfcBlock> {
     let lower = source.to_ascii_lowercase();
     let mut template = source.as_bytes().to_vec();
     let mut cursor = 0;
+    let mut open_elements: Vec<String> = Vec::new();
     while let Some(relative) = source[cursor..].find('<') {
         let start = cursor + relative;
         // A commented example is template trivia, not an executable script block.
@@ -138,35 +350,47 @@ fn extract_blocks(source: &str) -> Vec<SfcBlock> {
             break;
         };
         cursor = open_end;
+        if let Some(name) = source[start + 1..open_end].strip_prefix('/') {
+            // Closing tag: pop back to the matching open element (tolerates
+            // implicitly closed children); unknown closers are ignored.
+            let name = name
+                .trim_end_matches('>')
+                .split(|c: char| c.is_whitespace())
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if let Some(index) = open_elements.iter().rposition(|open| *open == name) {
+                open_elements.truncate(index);
+            }
+            continue;
+        }
         let Some((tag, attrs)) = parse_tag_open(&source[start..open_end]) else {
             continue;
         };
-        if !matches!(tag.as_str(), "script" | "style") {
+        let nested = !open_elements.is_empty();
+        if !matches!(tag.as_str(), "script" | "style") || nested {
+            // Only top-level <script>/<style> are component blocks. A <script>
+            // inside <svelte:head> (or any element) is DOM markup: keep it in the
+            // template, and skip its raw body so `<` in code is not read as a tag.
+            if matches!(tag.as_str(), "script" | "style") {
+                if let Some(close) = find_closing_tag(source, &lower, open_end, &tag) {
+                    cursor = close.1;
+                }
+                continue;
+            }
+            let self_closing = source[start..open_end].trim_end_matches('>').ends_with('/');
+            if is_element_name(&tag) && !self_closing && !is_void_or_optional_close(&tag) {
+                open_elements.push(tag);
+            }
             continue;
         }
-        let closing = format!("</{tag}");
-        let mut close_search = open_end;
-        let mut closing_span = None;
-        while let Some(relative) = lower[close_search..].find(&closing) {
-            let close_start = close_search + relative;
-            let boundary = close_start + closing.len();
-            if source[boundary..].starts_with('>')
-                || source[boundary..].starts_with(char::is_whitespace)
-            {
-                if let Some(close_end) = tag_end(source, close_start) {
-                    closing_span = Some((close_start, close_end));
-                }
-                break;
-            }
-            close_search = boundary;
-        }
+        let closing_span = find_closing_tag(source, &lower, open_end, &tag);
         let (content_end, end) = closing_span.unwrap_or((source.len(), source.len()));
         let content = source[open_end..content_end].to_string();
         let mut parts = vec![tag.clone()];
-        if tag == "script"
-            && (attr_contains(&attrs, "context=\"module\"")
-                || attr_contains(&attrs, "context='module'"))
-        {
+        // Svelte 4 `context="module"` and Svelte 5 bare `module` both run the
+        // script once per module instead of once per component instance.
+        if tag == "script" && is_module_script(&attrs) {
             parts.push("module".into());
         }
         if tag == "style" && attr_contains(&attrs, "global") {
@@ -194,6 +418,8 @@ fn extract_blocks(source: &str) -> Vec<SfcBlock> {
             content_start_col,
             content_hash: content_hash(&content),
             content,
+            attrs,
+            attrs_offset: start + 1 + tag.len(),
         });
         // Retain template source on either side, including on the same line.
         // Keep newline positions so child locations still refer to the original source.
@@ -223,6 +449,8 @@ fn extract_blocks(source: &str) -> Vec<SfcBlock> {
             content_start_col: 0,
             content_hash: content_hash(&content),
             content,
+            attrs: String::new(),
+            attrs_offset: 0,
         });
     }
     blocks
@@ -265,32 +493,17 @@ fn normalize_statement(line: &str) -> String {
 }
 
 fn parse_attr_labels(attrs: &str) -> Vec<(String, usize, usize)> {
-    let mut cursor = 0;
-    attrs
-        .split_whitespace()
-        .filter_map(|part| {
-            let start = cursor + attrs[cursor..].find(part)?;
-            let end = start + part.len();
-            cursor = end;
-            let clean = part.trim().trim_end_matches('>').trim_end_matches('/').trim();
-            if clean.is_empty() {
-                return None;
-            }
-            let (name, value) = clean.split_once('=').unwrap_or((clean, ""));
-            let name = name.trim();
+    split_attrs(attrs)
+        .into_iter()
+        .filter_map(|(raw, start, end)| {
+            let (name, value) = attr_name_value(&raw);
             if name.is_empty() {
                 return None;
             }
-            let label = if value.is_empty() {
-                name.to_string()
+            let label = if value.is_empty() && !raw.contains('=') {
+                name
             } else {
-                let value = value
-                    .trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .trim_matches('{')
-                    .trim_matches('}');
-                format!("{}={}", name, value)
+                format!("{name}={value}")
             };
             Some((label, start, end))
         })
@@ -384,12 +597,15 @@ fn extract_template_children(
             let close = after + close_rel;
             let raw_label = &line[after..close];
             let label = raw_label.trim();
-            if !label.is_empty() && !label.starts_with('#') && !label.starts_with('/') {
+            if !label.is_empty() && !label.starts_with('/') {
                 let leading = raw_label.len() - raw_label.trim_start().len();
                 let start = after + leading;
                 let child_id = format!("{}.{}", id_prefix, children.len());
+                // `{#if cond}` / `{#each items as item}` carry control-flow
+                // conditions; keep them instead of dropping the payload.
+                let node_type = if label.starts_with('#') { "block_tag" } else { "interpolation" };
                 children.push(make_leaf(
-                    &child_id, "interpolation", label, absolute_line,
+                    &child_id, node_type, normalize_js(label, &mut false), absolute_line,
                     line_column(line_idx, first_line_column, start),
                     line_column(line_idx, first_line_column, start + label.len()),
                 ));
@@ -397,7 +613,85 @@ fn extract_template_children(
             cursor = close + 1;
         }
     }
+    extract_template_text(content, start_line, first_line_column, id_prefix, &mut children);
     children
+}
+
+/// Static template text (DOM text content) between tags, outside `{...}` and
+/// `<!-- -->`. Whitespace runs collapse to one space, so reflowing markup stays
+/// layout-only while any wording, number or symbol edit is a semantic payload.
+fn extract_template_text(
+    content: &str,
+    start_line: u32,
+    first_line_column: u32,
+    id_prefix: &str,
+    children: &mut Vec<SemanticNode>,
+) {
+    let position = |offset: usize| -> (u32, u32) {
+        let (line, col) = source_position(content, offset);
+        let col = if line == 0 { first_line_column + col } else { col };
+        (start_line + line, col)
+    };
+    let flush = |children: &mut Vec<SemanticNode>, from: usize, to: usize| {
+        let raw = &content[from..to];
+        let label = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        if label.is_empty() {
+            return;
+        }
+        let lead = raw.len() - raw.trim_start().len();
+        let trail = raw.trim_end().len();
+        let (sl, sc) = position(from + lead);
+        let (el, ec) = position(from + trail);
+        let id = format!("{}.{}", id_prefix, children.len());
+        children.push(SemanticNodeBuilder::new(&id, "text", label, sl, sc, el, ec, "").build());
+    };
+    let bytes = content.as_bytes();
+    let mut text_start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' if content[i..].starts_with("<!--") => {
+                flush(children, text_start, i);
+                i = content[i + 4..].find("-->").map_or(content.len(), |n| i + 4 + n + 3);
+                text_start = i;
+            }
+            b'<' if bytes
+                .get(i + 1)
+                .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'/' || *b == b'!') =>
+            {
+                flush(children, text_start, i);
+                i = tag_end(content, i).unwrap_or(content.len());
+                text_start = i;
+            }
+            b'{' => {
+                flush(children, text_start, i);
+                let mut depth = 0usize;
+                let mut quote: Option<u8> = None;
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    match quote {
+                        Some(q) if b == q => quote = None,
+                        Some(_) if b == b'\\' => i += 1,
+                        Some(_) => {}
+                        None if matches!(b, b'"' | b'\'' | b'`') => quote = Some(b),
+                        None if b == b'{' => depth += 1,
+                        None if b == b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        None => {}
+                    }
+                    i += 1;
+                }
+                i = (i + 1).min(bytes.len());
+                text_start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    flush(children, text_start, bytes.len());
 }
 
 fn declaration_name(line: &str) -> Option<&str> {
@@ -445,6 +739,24 @@ fn assignment_label(line: &str) -> Option<String> {
     None
 }
 
+/// `raw` without a trailing `// comment` (quote-aware).
+fn strip_line_comment(raw: &str) -> &str {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, c) in raw.char_indices() {
+        match quote {
+            Some(_) if escaped => escaped = false,
+            Some(_) if c == '\\' => escaped = true,
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if matches!(c, '\'' | '"' | '`') => quote = Some(c),
+            None if raw[index..].starts_with("//") => return &raw[..index],
+            None => {}
+        }
+    }
+    raw
+}
+
 fn extract_script_children(
     content: &str,
     start_line: u32,
@@ -452,18 +764,33 @@ fn extract_script_children(
     id_prefix: &str,
 ) -> Vec<SemanticNode> {
     let mut children = Vec::new();
+    let mut in_comment = false;
     for (line_idx, raw_line) in content.lines().enumerate() {
-        let line = normalize_statement(raw_line);
-        if line.is_empty() || line == "{" || line == "}" {
+        let started_in_comment = in_comment;
+        // Comment- and quote-insensitive view of the line; comment-only and
+        // brace-only lines carry no executable payload.
+        let semantic = normalize_js(raw_line, &mut in_comment);
+        if semantic.chars().all(|c| matches!(c, '{' | '}' | '(' | ')' | '[' | ']' | ';' | ',')) {
+            continue;
+        }
+        let code = strip_line_comment(raw_line);
+        let line = normalize_statement(code);
+        if line.is_empty() {
             continue;
         }
         let absolute_line = start_line + line_idx as u32;
-        let leading = raw_line.find(&line).expect("normalized statement occurs in input line");
+        let leading = code.find(&line).unwrap_or(0);
         let start_col = line_column(line_idx, first_line_column, leading);
         let end_col = start_col + line.len() as u32;
         let child_id = format!("{}.{}", id_prefix, children.len());
-        let node = if line.starts_with("import ") {
-            Some(make_leaf(&child_id, "import_statement", line, absolute_line, start_col, end_col))
+        let node = if started_in_comment || code.contains("/*") {
+            // A block comment shares the line: keep the code it leaves.
+            Some(make_leaf(&child_id, "expression_statement", semantic, absolute_line, start_col, end_col))
+        } else if line.starts_with("import ") {
+            Some(make_leaf(
+                &child_id, "import_statement", normalize_js(&line, &mut false),
+                absolute_line, start_col, end_col,
+            ))
         } else if let Some(name) = declaration_name(&line) {
             let mut decl = make_leaf(
                 &child_id, "variable_declaration", name.to_string(),
@@ -476,7 +803,7 @@ fn extract_script_children(
                 if !rhs.is_empty() {
                     let rhs_start = start_col + (equals + 1 + remainder.len() - remainder.trim_start().len()) as u32;
                     decl.children = vec![make_leaf(
-                        &format!("{child_id}.0"), "declaration_value", rhs,
+                        &format!("{child_id}.0"), "declaration_value", normalize_js(rhs, &mut false),
                         absolute_line, rhs_start, rhs_start + rhs.len() as u32,
                     )];
                 }
@@ -501,14 +828,16 @@ fn extract_script_children(
                 if !rhs.is_empty() {
                     let rhs_start = start_col + (index + op.len() + remainder.len() - remainder.trim_start().len()) as u32;
                     assignment.children = vec![make_leaf(
-                        &format!("{child_id}.0"), "assignment_value", rhs,
+                        &format!("{child_id}.0"), "assignment_value", normalize_js(rhs, &mut false),
                         absolute_line, rhs_start, rhs_start + rhs.len() as u32,
                     )];
                 }
             }
             Some(assignment)
         } else {
-            None
+            // Calls and other statements (`console.log(1)`, `export let x`) are
+            // executable payload: retain them rather than certify edits as style.
+            Some(make_leaf(&child_id, "expression_statement", semantic, absolute_line, start_col, end_col))
         };
         if let Some(node) = node {
             children.push(node);
@@ -566,6 +895,35 @@ fn extract_style_children(
     children
 }
 
+/// Opening-tag attributes of a script/style block that its label does not
+/// already encode (`src`, `type`, `generics`, `nonce`, ...): an edit to any of
+/// them changes what the component loads or runs.
+fn block_attribute_children(source: &str, block: &SfcBlock, id: &str) -> Vec<SemanticNode> {
+    let tag = if block.node_type == "script_block" { "script" } else { "style" };
+    let Some(raw_attrs) = source.get(block.attrs_offset..) else {
+        return Vec::new();
+    };
+    let lead = raw_attrs.find(block.attrs.as_str()).unwrap_or(0);
+    let base = block.attrs_offset + lead;
+    split_attrs(&block.attrs)
+        .into_iter()
+        .filter_map(|(raw, a, b)| {
+            let (name, value) = attr_name_value(&raw);
+            if name.is_empty() || is_block_label_attr(tag, &name, &value) {
+                return None;
+            }
+            let label = if value.is_empty() && !raw.contains('=') { name } else { format!("{name}={value}") };
+            Some((label, a, b))
+        })
+        .enumerate()
+        .map(|(i, (label, a, b))| {
+            let (sl, sc) = source_position(source, base + a);
+            let (el, ec) = source_position(source, base + b);
+            SemanticNodeBuilder::new(&format!("{id}.a{i}"), "attribute", label, sl, sc, el, ec, "").build()
+        })
+        .collect()
+}
+
 fn process_impl(source: &str, filename: &str) -> String {
     let stem = filename
         .rsplit(['/', '\\'])
@@ -585,12 +943,13 @@ fn process_impl(source: &str, filename: &str) -> String {
         .enumerate()
         .map(|(i, b)| {
             let id = format!("0.{}", i);
-            let block_children = match b.node_type {
+            let mut block_children = block_attribute_children(source, b, &id);
+            block_children.extend(match b.node_type {
                 "script_block" => extract_script_children(&b.content, b.content_start_line, b.content_start_col, &id),
                 "style_block" => extract_style_children(&b.content, b.content_start_line, b.content_start_col, &id),
                 "template_body" => extract_template_children(&b.content, b.content_start_line, b.content_start_col, &id),
                 _ => Vec::new(),
-            };
+            });
             SemanticNodeBuilder::new(
                 &id,
                 b.node_type,
@@ -762,8 +1121,9 @@ mod tests {
         );
         let old: serde_json::Value = serde_json::from_str(&old).unwrap();
         let new: serde_json::Value = serde_json::from_str(&new).unwrap();
-        assert!(collect_labels(&old).contains(&"'One'".to_string()));
-        assert!(collect_labels(&new).contains(&"'Two'".to_string()));
+        // String literals are labelled in canonical double-quoted spelling.
+        assert!(collect_labels(&old).contains(&"\"One\"".to_string()));
+        assert!(collect_labels(&new).contains(&"\"Two\"".to_string()));
         assert!(collect_labels(&new).contains(&"h1".to_string()));
         assert_ne!(old["structural_hash"], new["structural_hash"]);
     }
@@ -893,6 +1253,185 @@ mod tests {
         assert_eq!(value["position"]["start_line"], 5);
         assert_eq!(value["position"]["start_col"], 11);
         assert_eq!(value["position"]["end_col"], 14);
+    }
+
+    // -- 0.0.3 regressions: #7 (module context, nested head script) and #8 (static text) --
+
+    fn tree(source: &str) -> serde_json::Value {
+        serde_json::from_str(&process_impl(source, "assessment.svelte")).expect("tree JSON")
+    }
+
+    fn find_node<'a>(node: &'a serde_json::Value, kind: &str, label: &str) -> Option<&'a serde_json::Value> {
+        if node["node_type"] == kind && node["label"] == label {
+            return Some(node);
+        }
+        node["children"].as_array()?.iter().find_map(|child| find_node(child, kind, label))
+    }
+
+    fn span(node: &serde_json::Value) -> (u64, u64, u64, u64) {
+        let p = &node["position"];
+        (
+            p["start_line"].as_u64().unwrap(),
+            p["start_col"].as_u64().unwrap(),
+            p["end_line"].as_u64().unwrap(),
+            p["end_col"].as_u64().unwrap(),
+        )
+    }
+
+    /// Semantic projection without ids/positions/hashes: what a diff compares.
+    fn shape(node: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "t": node["node_type"],
+            "l": node["label"],
+            "c": node["children"].as_array().map(|c| c.iter().map(shape).collect::<Vec<_>>()).unwrap_or_default(),
+        })
+    }
+
+    #[test]
+    fn svelte5_module_flag_is_module_context() {
+        // web-svelte-module_context (#7)
+        let old = tree("<script>console.log(1);</script>\n<div>Hello</div>\n");
+        let new = tree("<script module>console.log(1);</script>\n<div>Hello</div>\n");
+        assert!(find_node(&old, "script_block", "script").is_some());
+        assert!(find_node(&new, "script_block", "script:module").is_some());
+        // The once-per-module side effect itself is retained with its source span.
+        let stmt = find_node(&new, "expression_statement", "console.log(1)").expect("statement kept");
+        assert_eq!(span(stmt), (0, 15, 0, 29));
+        assert!(find_node(&new, "text", "Hello").is_some(), "template after inline script kept");
+        assert_ne!(shape(&old), shape(&new));
+        // Svelte 4 spelling is the same context, so the two spellings are equivalent.
+        let legacy = tree("<script context=\"module\">console.log(1);</script>\n<div>Hello</div>\n");
+        assert_eq!(shape(&legacy), shape(&new));
+    }
+
+    #[test]
+    fn nested_head_script_is_template_markup_with_src() {
+        // web-svelte-head_script_src (#7)
+        let old_src = "<svelte:head>\n<script src=\"./safe.js\"></script>\n</svelte:head>\n<div>Hello</div>\n";
+        let new_src = old_src.replace("./safe.js", "./danger.js");
+        let old = tree(old_src);
+        let new = tree(&new_src);
+        for t in [&old, &new] {
+            assert!(find_node(t, "script_block", "script").is_none(), "head script is not a component block");
+            assert!(find_node(t, "element", "svelte:head").is_some());
+            assert!(find_node(t, "element", "script").is_some());
+        }
+        let attr = find_node(&old, "attribute", "src=./safe.js").expect("old src");
+        assert_eq!(span(attr), (1, 8, 1, 23));
+        let attr = find_node(&new, "attribute", "src=./danger.js").expect("new src");
+        assert_eq!(span(attr), (1, 8, 1, 25));
+        assert_ne!(shape(&old), shape(&new));
+    }
+
+    #[test]
+    fn top_level_script_after_head_is_still_a_block() {
+        let t = tree("<svelte:head><title>x</title></svelte:head>\n<p>a\n<script>let a = 1;</script>\n");
+        assert!(find_node(&t, "script_block", "script").is_some());
+        assert!(find_node(&t, "declaration_value", "1").is_some());
+    }
+
+    #[test]
+    fn block_attributes_are_retained_and_quote_insensitive() {
+        let a = tree("<script src=\"./a.js\" lang=\"ts\"></script>\n");
+        let b = tree("<script src='./b.js' lang='ts'></script>\n");
+        let a2 = tree("<script src='./a.js'  lang=ts></script>\n");
+        let attr = find_node(&a, "attribute", "src=./a.js").expect("block src attribute");
+        assert_eq!(span(attr), (0, 8, 0, 20));
+        assert!(find_node(&a, "script_block", "script:ts").is_some());
+        assert_ne!(shape(&a), shape(&b));
+        assert_eq!(shape(&a), shape(&a2));
+    }
+
+    #[test]
+    fn static_template_text_is_retained() {
+        // web-svelte-text (#8)
+        let old = tree("<p>Ready</p>\n");
+        let new = tree("<p>Failed</p>\n");
+        assert_eq!(span(find_node(&old, "text", "Ready").expect("old text")), (0, 3, 0, 8));
+        assert_eq!(span(find_node(&new, "text", "Failed").expect("new text")), (0, 3, 0, 9));
+        assert_ne!(shape(&old), shape(&new));
+    }
+
+    #[test]
+    fn unicode_template_text_keeps_payload_and_byte_columns() {
+        // web-svelte-unicode (#8)
+        let old_src = "<p>Café: 5 €</p>\n";
+        let new_src = "<p>Café: 6 €</p>\n";
+        let old = tree(old_src);
+        let new = tree(new_src);
+        let end = (old_src.find("</p>").unwrap()) as u64;
+        assert_eq!(span(find_node(&old, "text", "Café: 5 €").expect("old")), (0, 3, 0, end));
+        assert_eq!(span(find_node(&new, "text", "Café: 6 €").expect("new")), (0, 3, 0, end));
+        assert_ne!(shape(&old), shape(&new));
+    }
+
+    #[test]
+    fn text_layout_comments_and_interpolations_are_not_text_payload() {
+        let a = tree("<p>Hello   world</p>\n<!-- note -->\n<h1>{title}</h1>\n");
+        let b = tree("<p>\n  Hello\n  world\n</p>\n<!-- other note -->\n<h1>{ title }</h1>\n");
+        assert_eq!(shape(&a), shape(&b));
+        assert!(find_node(&a, "text", "title").is_none());
+        assert!(find_node(&a, "interpolation", "title").is_some());
+        // Multi-line text keeps an exact multi-line span.
+        assert_eq!(span(find_node(&b, "text", "Hello world").unwrap()), (1, 2, 2, 7));
+        // A comment containing tag-like text does not leak into text.
+        let c = tree("<!-- <p>Ready</p> -->\n<p>Ready</p>\n");
+        let texts = collect_labels(&c).into_iter().filter(|l| l == "Ready").count();
+        assert_eq!(texts, 1);
+    }
+
+    #[test]
+    fn block_tag_conditions_are_retained() {
+        let a = tree("{#if count > 1}<p>many</p>{/if}\n");
+        let b = tree("{#if count > 2}<p>many</p>{/if}\n");
+        assert!(find_node(&a, "block_tag", "#if count>1").is_some());
+        assert_ne!(shape(&a), shape(&b));
+    }
+
+    #[test]
+    fn string_quote_spelling_is_not_semantic() {
+        // web-svelte-preservation
+        let old = tree("<script>const title = 'Ready';</script>\n<h1>{title}</h1>\n");
+        let new = tree("<script>const title = \"Ready\";</script>\n<h1>{title}</h1>\n");
+        assert_eq!(shape(&old), shape(&new));
+        assert!(find_node(&new, "declaration_value", "\"Ready\"").is_some());
+        // ...but the string value itself is.
+        let changed = tree("<script>const title = \"Done\";</script>\n<h1>{title}</h1>\n");
+        assert_ne!(shape(&new), shape(&changed));
+    }
+
+    #[test]
+    fn script_comments_are_trivia_and_statements_are_payload() {
+        let a = tree("<script>\n  // init\n  init(1);\n  /* a\n  b */\n  let x = 1; // one\n</script>\n");
+        let b = tree("<script>\n  init( 1 );\n  let x = 1;\n</script>\n");
+        assert_eq!(shape(&a), shape(&b));
+        let c = tree("<script>\n  init(2);\n  let x = 1;\n</script>\n");
+        assert_ne!(shape(&b), shape(&c));
+        let commented = tree("<script>\n  // let x = 2;\n</script>\n");
+        assert!(collect_labels(&commented).iter().all(|l| !l.contains("x")));
+    }
+
+    #[test]
+    fn normalize_js_canonical_forms() {
+        let n = |s: &str| normalize_js(s, &mut false);
+        assert_eq!(n("'a\\'b'"), n("\"a'b\""));
+        assert_eq!(n("a  +  b"), "a+b");
+        assert_eq!(n("a + +b"), "a+ +b");
+        assert_eq!(n("typeof  x"), "typeof x");
+        assert_eq!(n("`a  ${b}`"), "`a  ${b}`");
+        assert_eq!(n("f('x', \"y\");"), "f(\"x\",\"y\")");
+    }
+
+    #[test]
+    fn malformed_inputs_never_panic() {
+        for src in [
+            "<script>let count =", "<p>{unclosed", "<p>é{", "{'é", "<svelte:head><script src=x>",
+            "</div></svelte:head><script>a</script>", "<p a=\"é\" b='{x}'>é</p>", "<!-- é", "<", "{#if", "é<a",
+        ] {
+            let out = process_impl(src, "x.svelte");
+            serde_json::from_str::<serde_json::Value>(&out).expect("valid JSON");
+            assert_eq!(out, process_impl(src, "x.svelte"), "deterministic");
+        }
     }
 
     fn collect_labels(value: &serde_json::Value) -> Vec<String> {
