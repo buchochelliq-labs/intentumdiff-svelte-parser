@@ -851,6 +851,51 @@ fn strip_line_comment(raw: &str) -> &str {
     raw
 }
 
+/// `raw` with every `/* ... */` comment byte replaced by a space, so byte
+/// offsets still index the source line. Quote-aware; a `//` comment is left
+/// for `strip_line_comment`. `in_comment` carries an open comment across lines.
+fn blank_block_comments(raw: &str, in_comment: &mut bool) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut index = 0;
+    while let Some(c) = raw[index..].chars().next() {
+        let rest = &raw[index..];
+        if *in_comment {
+            if rest.starts_with("*/") {
+                *in_comment = false;
+                out.push_str("  ");
+                index += 2;
+            } else {
+                out.extend(std::iter::repeat_n(' ', c.len_utf8()));
+                index += c.len_utf8();
+            }
+            continue;
+        }
+        match quote {
+            Some(_) if escaped => escaped = false,
+            Some(_) if c == '\\' => escaped = true,
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if matches!(c, '\'' | '"' | '`') => quote = Some(c),
+            None if rest.starts_with("//") => {
+                out.push_str(rest);
+                break;
+            }
+            None if rest.starts_with("/*") => {
+                *in_comment = true;
+                out.push_str("  ");
+                index += 2;
+                continue;
+            }
+            None => {}
+        }
+        out.push(c);
+        index += c.len_utf8();
+    }
+    out
+}
+
 fn extract_script_children(
     content: &str,
     start_line: u32,
@@ -860,14 +905,16 @@ fn extract_script_children(
     let mut children = Vec::new();
     let mut in_comment = false;
     for (line_idx, raw_line) in content.lines().enumerate() {
-        let started_in_comment = in_comment;
+        // Block comments blanked to spaces (byte offsets kept), so a statement
+        // sharing its line with `/* ... */` is classified like any other.
+        let blanked = blank_block_comments(raw_line, &mut in_comment);
         // Comment- and quote-insensitive view of the line; comment-only and
         // brace-only lines carry no executable payload.
-        let semantic = normalize_js(raw_line, &mut in_comment);
+        let semantic = normalize_js(&blanked, &mut false);
         if semantic.chars().all(|c| matches!(c, '{' | '}' | '(' | ')' | '[' | ']' | ';' | ',')) {
             continue;
         }
-        let code = strip_line_comment(raw_line);
+        let code = strip_line_comment(&blanked);
         let line = normalize_statement(code);
         if line.is_empty() {
             continue;
@@ -877,10 +924,7 @@ fn extract_script_children(
         let start_col = line_column(line_idx, first_line_column, leading);
         let end_col = start_col + line.len() as u32;
         let child_id = format!("{}.{}", id_prefix, children.len());
-        let node = if started_in_comment || code.contains("/*") {
-            // A block comment shares the line: keep the code it leaves.
-            Some(make_leaf(&child_id, "expression_statement", semantic, absolute_line, start_col, end_col))
-        } else if line.starts_with("import ") {
+        let node = if line.starts_with("import ") {
             Some(make_leaf(
                 &child_id, "import_statement", normalize_js(&line, &mut false),
                 absolute_line, start_col, end_col,
@@ -1018,6 +1062,19 @@ fn block_attribute_children(source: &str, block: &SfcBlock, id: &str) -> Vec<Sem
         .collect()
 }
 
+/// Deterministic `type\0label` pre-order serialization of `nodes` (no ids,
+/// positions or raw text), used to hash a block by what it means.
+fn project(nodes: &[SemanticNode], out: &mut String) {
+    for node in nodes {
+        out.push_str(&node.node_type);
+        out.push('\0');
+        out.push_str(&node.label);
+        out.push('\u{1}');
+        project(&node.children, out);
+        out.push('\u{2}');
+    }
+}
+
 fn process_impl(source: &str, filename: &str) -> String {
     let stem = filename
         .rsplit(['/', '\\'])
@@ -1044,6 +1101,16 @@ fn process_impl(source: &str, filename: &str) -> String {
                 "template_body" => extract_template_children(&b.content, b.content_start_line, b.content_start_col, &id),
                 _ => Vec::new(),
             });
+            // A script block hashes its semantic projection, not its raw text:
+            // comments and layout are trivia there (the children drop them), so
+            // a comment-only edit must not change the block or component hash.
+            let hash = if b.node_type == "script_block" {
+                let mut projection = String::new();
+                project(&block_children, &mut projection);
+                content_hash(&projection)
+            } else {
+                b.content_hash.clone()
+            };
             SemanticNodeBuilder::new(
                 &id,
                 b.node_type,
@@ -1052,7 +1119,7 @@ fn process_impl(source: &str, filename: &str) -> String {
                 b.start_col,
                 b.end_line,
                 b.end_col,
-                b.content_hash.clone(),
+                hash,
             )
             .children(block_children)
             .build()
@@ -1060,9 +1127,9 @@ fn process_impl(source: &str, filename: &str) -> String {
         .collect();
 
     let root_hash: String = {
-        let combined: String = blocks
+        let combined: String = children
             .iter()
-            .map(|b| b.content_hash.as_str())
+            .map(|b| b.structural_hash.as_str())
             .collect::<Vec<_>>()
             .join("|");
         let mut h: u64 = 5381;
@@ -1572,6 +1639,32 @@ mod tests {
         assert_eq!(n("(a) / 2"), "(a)/2");
         assert_eq!(n("return  /a b/"), n("return /a b/"));
         assert!(n("return /a b/").ends_with("/a b/"));
+    }
+
+    #[test]
+    fn issue12_inline_block_comment_keeps_statement_classification() {
+        let old = tree("<script>\nlet x = 1;\n</script>\n");
+        let new = tree("<script>\nlet x = 1; /* note */\n</script>\n");
+        assert!(find_node(&new, "variable_declaration", "x").is_some());
+        assert!(find_node(&new, "expression_statement", "let x=1").is_none());
+        assert_eq!(shape(&old), shape(&new));
+        assert_eq!(old["structural_hash"], new["structural_hash"]);
+        let value = find_node(&new, "declaration_value", "1").expect("value kept");
+        assert_eq!(span(value), (1, 8, 1, 9));
+        // The value on the commented line is still payload.
+        let changed = tree("<script>\nlet x = 2; /* note */\n</script>\n");
+        assert!(find_node(&changed, "declaration_value", "2").is_some());
+        assert_ne!(shape(&new), shape(&changed));
+        // Leading comment, comment closing a multi-line one, and assignment/import paths.
+        let a = tree("<script>\n/* a */ count += 2;\n/* b\n c */ import x from 'y';\n</script>\n");
+        assert!(find_node(&a, "assignment_value", "2").is_some());
+        assert!(find_node(&a, "import_statement", "import x from\"y\"").is_some());
+        let v = find_node(&a, "assignment_value", "2").unwrap();
+        assert_eq!(span(v), (1, 17, 1, 18));
+        // A `/*` inside a string or after `//` is not a comment.
+        let s = tree("<script>\nlet p = '/*'; // x /* y\nlet q = 1;\n</script>\n");
+        assert!(find_node(&s, "declaration_value", "\"/*\"").is_some());
+        assert!(find_node(&s, "variable_declaration", "q").is_some());
     }
 
     fn collect_labels(value: &serde_json::Value) -> Vec<String> {
