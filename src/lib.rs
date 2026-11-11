@@ -331,6 +331,32 @@ fn normalize_js(text: &str, in_comment: &mut bool) -> String {
                 }
                 out.push('"');
             }
+            // A regular-expression literal: whitespace inside it is pattern
+            // payload (`/a +b/` is not `/a+b/`), so copy it verbatim.
+            '/' if regex_allowed(&out) => {
+                push_token(&mut out, &mut pending_space, '/');
+                i += 1;
+                let mut in_class = false;
+                while i < chars.len() {
+                    let ch = chars[i];
+                    out.push(ch);
+                    i += 1;
+                    match ch {
+                        '\\' if i < chars.len() => {
+                            out.push(chars[i]);
+                            i += 1;
+                        }
+                        '[' => in_class = true,
+                        ']' => in_class = false,
+                        '/' if !in_class => break,
+                        _ => {}
+                    }
+                }
+                while i < chars.len() && chars[i].is_ascii_alphabetic() {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
             '`' => {
                 push_token(&mut out, &mut pending_space, '`');
                 i += 1;
@@ -358,6 +384,31 @@ fn normalize_js(text: &str, in_comment: &mut bool) -> String {
         }
     }
     out.trim_end_matches([';', ',']).trim().to_string()
+}
+
+/// Whether a `/` after the canonical text `out` starts a regular-expression
+/// literal rather than a division: at the start, after an operator or opening
+/// punctuator, or after a keyword such as `return`/`typeof`.
+fn regex_allowed(out: &str) -> bool {
+    let Some(last) = out.chars().last() else {
+        return true;
+    };
+    if "(,=:[!&|?{};+-*%<>~^".contains(last) {
+        return true;
+    }
+    let word: String = out
+        .chars()
+        .rev()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    matches!(
+        word.as_str(),
+        "return" | "typeof" | "instanceof" | "in" | "of" | "new" | "delete" | "void"
+            | "throw" | "case" | "do" | "else" | "yield" | "await"
+    )
 }
 
 // Source spans are 0-based UTF-8 byte columns and have exclusive ends.
@@ -1497,6 +1548,30 @@ mod tests {
         let t = tree("<div on:click={() => a > b}>x</div>\n<script>let n = 1;</script>\n");
         assert!(find_node(&t, "script_block", "script").is_some());
         assert!(find_node(&t, "text", "x").is_some());
+    }
+
+    #[test]
+    fn issue11_regex_literal_whitespace_is_semantic() {
+        let old = tree("<script>const x = /a +b/;</script>\n");
+        let new = tree("<script>const x = /a+b/;</script>\n");
+        assert!(find_node(&old, "declaration_value", "/a +b/").is_some());
+        assert!(find_node(&new, "declaration_value", "/a+b/").is_some());
+        assert_ne!(shape(&old), shape(&new));
+        assert_ne!(old["structural_hash"], new["structural_hash"]);
+        // Spacing outside the literal stays layout.
+        assert_eq!(
+            shape(&tree("<script>x=/a b/;</script>\n")),
+            shape(&tree("<script>x = /a b/;</script>\n"))
+        );
+        let n = |s: &str| normalize_js(s, &mut false);
+        assert_eq!(n("f( /a  b/g , c )"), "f(/a  b/g,c)");
+        assert_eq!(n("/[/ ]x/ . test( s )"), "/[/ ]x/.test(s)");
+        assert_eq!(n("/a\\/ b/"), "/a\\/ b/");
+        // Division is not a regex.
+        assert_eq!(n("a / b / c"), "a/b/c");
+        assert_eq!(n("(a) / 2"), "(a)/2");
+        assert_eq!(n("return  /a b/"), n("return /a b/"));
+        assert!(n("return /a b/").ends_with("/a b/"));
     }
 
     fn collect_labels(value: &serde_json::Value) -> Vec<String> {
