@@ -107,15 +107,52 @@ fn attr_lang(attrs: &str) -> Option<String> {
     None
 }
 
+/// Byte offset just past the `>` closing the tag at `start`. Quoted attribute
+/// values and `{expression}` attribute values (`on:click={() => a > b}`) are
+/// skipped, so a `>` inside them does not end the tag.
 fn tag_end(source: &str, start: usize) -> Option<usize> {
     let mut quote = None;
-    for (offset, c) in source[start..].char_indices() {
+    let mut index = start;
+    while let Some(c) = source[index..].chars().next() {
         match (quote, c) {
             (Some(q), c) if q == c => quote = None,
             (None, '\'' | '"') => quote = Some(c),
-            (None, '>') => return Some(start + offset + 1),
+            (None, '{') => {
+                index = expression_end(source, index)?;
+                continue;
+            }
+            (None, '>') => return Some(index + 1),
             _ => {}
         }
+        index += c.len_utf8();
+    }
+    None
+}
+
+/// Byte offset just past the `}` matching the `{` at `start`, skipping nested
+/// braces and JavaScript string/template literals; `None` if it never closes.
+fn expression_end(source: &str, start: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut i = start;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(_) if b == b'\\' => i += 1,
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None if matches!(b, b'"' | b'\'' | b'`') => quote = Some(b),
+            None if b == b'{' => depth += 1,
+            None if b == b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            None => {}
+        }
+        i += 1;
     }
     None
 }
@@ -337,8 +374,14 @@ fn extract_blocks(source: &str) -> Vec<SfcBlock> {
     let mut template = source.as_bytes().to_vec();
     let mut cursor = 0;
     let mut open_elements: Vec<String> = Vec::new();
-    while let Some(relative) = source[cursor..].find('<') {
+    while let Some(relative) = source[cursor..].find(['<', '{']) {
         let start = cursor + relative;
+        // A template expression (`{a < b}`) is JavaScript, not markup: skip it
+        // whole so a `<` inside it is never read as a tag. An unclosed `{` is text.
+        if source[start..].starts_with('{') {
+            cursor = expression_end(source, start).unwrap_or(start + 1);
+            continue;
+        }
         // A commented example is template trivia, not an executable script block.
         if source[start..].starts_with("<!--") {
             cursor = source[start + 4..]
@@ -1432,6 +1475,28 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&out).expect("valid JSON");
             assert_eq!(out, process_impl(src, "x.svelte"), "deterministic");
         }
+    }
+
+    #[test]
+    fn issue10_lt_inside_template_expression_is_not_a_tag() {
+        let old = tree("<div>{a < b}</div>\n<script>let n = 1;</script>\n");
+        let new = tree("<div>{a < b}</div>\n<script>let n = 2;</script>\n");
+        for t in [&old, &new] {
+            assert!(find_node(t, "script_block", "script").is_some(), "top-level script is a block");
+            assert!(find_node(t, "variable_declaration", "n").is_some());
+            assert!(find_node(t, "element", "script").is_none());
+            assert!(find_node(t, "element", "div").is_some());
+        }
+        assert!(find_node(&old, "declaration_value", "1").is_some());
+        assert!(find_node(&new, "declaration_value", "2").is_some());
+        assert_ne!(shape(&old), shape(&new));
+        // Strings and nested braces inside the expression do not end it early.
+        let t = tree("<p>{f('}', { k: a < b })}</p>\n<script>let n = 1;</script>\n");
+        assert!(find_node(&t, "script_block", "script").is_some());
+        // `=>` / `>` inside an attribute expression does not end the opening tag.
+        let t = tree("<div on:click={() => a > b}>x</div>\n<script>let n = 1;</script>\n");
+        assert!(find_node(&t, "script_block", "script").is_some());
+        assert!(find_node(&t, "text", "x").is_some());
     }
 
     fn collect_labels(value: &serde_json::Value) -> Vec<String> {
